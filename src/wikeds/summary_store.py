@@ -6,6 +6,7 @@ Raw events never come through here, they stay in local sqlite.
 """
 import logging
 import sqlite3
+import threading
 from pathlib import Path
 
 import pandas as pd
@@ -13,6 +14,10 @@ import pandas as pd
 from wikeds import config
 
 log = logging.getLogger("wiki-store")
+
+_schema_lock = threading.Lock()
+_schema_ready = set()   # stores whose schema this process already checked
+_PG_LOCK_KEY = 727001    # advisory lock id, any constant works
 
 COLS = ["hour_start", "wiki", "type", "bot", "edits", "editors", "net_bytes"]
 
@@ -67,14 +72,34 @@ class Store:
         cur.execute(sql.format(p=self.p), params)
         return cur
 
+    def _pg_tables_exist(self):
+        row = self._exec(
+            "SELECT to_regclass('public.summary_hourly') IS NOT NULL "
+            "AND to_regclass('public.summary_meta') IS NOT NULL"
+        ).fetchone()
+        return bool(row[0])
+
     def ensure_schema(self):
-        with self._tx():
-            cur = self.con.cursor()
-            for stmt in _SCHEMA:
-                cur.execute(stmt)
-            if self.p != "?":
-                for stmt in _PG_EXTRA:
+        """Create tables once. Postgres can't create the same table from two
+        connections at the same moment (listener + dashboard on startup), so check
+        first and serialize the create with an advisory lock."""
+        with _schema_lock:
+            if self.label in _schema_ready:
+                return
+            is_pg = self.p != "?"
+            if is_pg and self._pg_tables_exist():
+                _schema_ready.add(self.label)
+                return
+            with self._tx():
+                cur = self.con.cursor()
+                if is_pg:
+                    cur.execute("SELECT pg_advisory_xact_lock(%s)", (_PG_LOCK_KEY,))
+                for stmt in _SCHEMA:
                     cur.execute(stmt)
+                if is_pg:
+                    for stmt in _PG_EXTRA:
+                        cur.execute(stmt)
+            _schema_ready.add(self.label)
 
     def get_meta(self, key):
         row = self._exec(_GET_META, (key,)).fetchone()
