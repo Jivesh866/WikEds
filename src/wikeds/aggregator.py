@@ -43,6 +43,10 @@ class Aggregator:
         self.history_days = int(history_days)
         self._hist_checked = 0.0
         self.history_error = None    # set when the summary store can't be read
+        self.history_last_ok = None  # wall clock of the last good summary read
+        self.history_read_ms = None
+        self.summary_label = None    # 'Supabase' or 'local sqlite'
+        self.meta = {}               # last_rollup_at, rolled_through (from the summary store)
         self._bucket_offset = None   # UTC offset the summary hours are aligned to (from summary_meta)
         self.tz = tz
         self._lock = threading.Lock()  # one DuckDB connection shared across threads
@@ -331,6 +335,84 @@ class Aggregator:
         """, [since, int(limit)])
         return df["wiki"].tolist()
 
+    # ------------------------------------------------------------------ anomalies + drilldown
+    def events_frame(self, minutes=180):
+        """Raw recent events as a frame, for the z-score detectors in anomaly.py."""
+        since, _ = self._since(minutes)
+        return self._df("""
+            SELECT event_time, wiki, server_name, type, title, "user", bot,
+                   old_len, new_len, namespace
+            FROM recent
+            WHERE event_time >= ?
+        """, [since])
+
+    def top_editors(self, minutes=15, limit=10, include_bots=True, wikis=None):
+        """Most active editors: edits, distinct pages, net bytes."""
+        since, _ = self._since(minutes)
+        f, fp = self._filters(include_bots, wikis)
+        return self._df(f"""
+            SELECT "user",
+                   coalesce(max(bot), 0) = 1 AS bot,
+                   count(*) AS edits,
+                   count(DISTINCT title) AS pages,
+                   CAST(sum({_DELTA}) AS BIGINT) AS net_bytes
+            FROM recent
+            WHERE event_time >= ? AND "user" IS NOT NULL {f}
+            GROUP BY "user"
+            ORDER BY edits DESC, "user"
+            LIMIT ?
+        """, [since, *fp, int(limit)])
+
+    # ------------------------------------------------------------------ pipeline health
+    def ingest_health(self, minutes=10):
+        """How fast events are arriving and how long they take to reach us.
+
+        Lag is ingested_at - event_time, so it covers wikimedia's delay plus ours.
+        The rate is averaged over `minutes`, so it reads low just after a restart.
+        """
+        since = int(time.time()) - int(minutes) * 60
+        n, p50, p95 = self._one("""
+            SELECT count(*),
+                   quantile_cont(ingested_at - event_time, 0.5),
+                   quantile_cont(ingested_at - event_time, 0.95)
+            FROM recent WHERE ingested_at >= ?
+        """, [since])
+        return {"minutes": minutes, "per_min": n / minutes, "lag_p50": p50, "lag_p95": p95}
+
+    def ingest_per_minute(self, minutes=30):
+        """Events ingested per minute (by arrival time), gap-filled. Zeros = nothing arrived."""
+        _, minutes = self._since(minutes)
+        hi = (int(time.time()) // 60) * 60 - 60      # last complete minute
+        lo = hi - (minutes - 1) * 60
+        df = self._df("""
+            WITH grid AS (
+                SELECT bucket FROM generate_series(CAST(? AS BIGINT), CAST(? AS BIGINT), 60) AS g(bucket)
+            ),
+            agg AS (
+                SELECT (ingested_at // 60) * 60 AS bucket, count(*) AS events
+                FROM recent WHERE ingested_at >= ? AND ingested_at < ?
+                GROUP BY 1
+            )
+            SELECT grid.bucket AS minute, coalesce(agg.events, 0) AS events
+            FROM grid LEFT JOIN agg USING (bucket)
+            ORDER BY grid.bucket
+        """, [lo, hi, lo, hi + 60])
+        return self._to_local(df, "minute")
+
+    def summary_status(self):
+        """State of the summary store as of the last history read (at most a minute old)."""
+        now = time.time()
+        rollup_at = self.meta.get("last_rollup_at")
+        return {
+            "source": self.summary_label or ("Supabase" if config.SUMMARY_DB_URL else "local sqlite"),
+            "error": self.history_error,
+            "last_ok_age_s": None if self.history_last_ok is None else now - self.history_last_ok,
+            "read_ms": self.history_read_ms,
+            "rows_cached": self._one("SELECT count(*) FROM hist")[0],
+            "last_rollup_age_s": None if not rollup_at else now - rollup_at,
+            "rolled_through": self.meta.get("rolled_through"),
+        }
+
     # ------------------------------------------------------------------ history
     def _read_summary(self, since_hour):
         store = open_store()
@@ -338,6 +420,8 @@ class Aggregator:
             off = store.get_meta("bucket_offset")
             if off is not None:
                 self._bucket_offset = int(off)
+            self.summary_label = store.label
+            self.meta = {k: store.get_meta(k) for k in ("last_rollup_at", "rolled_through")}
             return store.read_hours(since_hour)
         finally:
             store.close()
@@ -359,12 +443,15 @@ class Aggregator:
             last = self.con.execute("SELECT max(hour_start) FROM hist").fetchall()[0][0]
         since = cutoff if last is None else max(cutoff, last - 2 * 3600)
         try:
+            t0 = time.perf_counter()
             df = self._read_summary(since)   # network call, so kept outside the lock
+            self.history_read_ms = (time.perf_counter() - t0) * 1000
         except Exception as e:
             self.history_error = str(e).strip().splitlines()[0] if str(e).strip() else type(e).__name__
             log.warning("could not read summaries: %s", e)
             return 0
         self.history_error = None
+        self.history_last_ok = time.time()
         with self._lock:
             self.con.execute("DELETE FROM hist WHERE hour_start >= ?", [since])
             if len(df):

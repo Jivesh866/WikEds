@@ -90,6 +90,7 @@ def run_rollup(raw, store, now=None, grace_seconds=300, offset=None):
     complete_end = bucket_start(now - grace_seconds, offset)  # every hour before this is final
     new_rolled = max(complete_end, rolled if rolled is not None else start)
     store.set_meta("rolled_through", new_rolled)
+    store.set_meta("last_rollup_at", int(time.time()))
 
     return {"rows_written": rows_written, "start": start, "end": end,
             "rolled_through": new_rolled, "offset": offset}

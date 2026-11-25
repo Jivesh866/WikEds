@@ -54,6 +54,7 @@ def test_groups_by_hour_and_bot():
 
     assert totals(store) == {(BASE, 0): 2, (BASE, 1): 1, (BASE + 3600, 0): 1}
     assert store.get_meta("bucket_offset") == OFF
+    assert store.get_meta("last_rollup_at") is not None
     assert stats["rolled_through"] == BASE + 2 * 3600       # last complete hour
     hour0 = store.read_hours(0).query("hour_start == @BASE and bot == 0").iloc[0]
     assert hour0["editors"] == 2 and hour0["net_bytes"] == 100
