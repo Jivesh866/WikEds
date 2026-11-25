@@ -1,6 +1,7 @@
 import inspect
 import threading
 import time
+from pathlib import Path
 from urllib.parse import quote
 
 import pandas as pd
@@ -107,9 +108,26 @@ def fmt_age(seconds):
 
 
 # ----------------------------------------------------------------- data access
-@st.cache_resource(show_spinner="Loading recent events...")
-def get_aggregator(db_path):
+# newest file change in the package. After a deploy it changes, so the cached aggregator is
+# rebuilt from the new code instead of an old object missing the new methods.
+CODE_VERSION = max(p.stat().st_mtime for p in Path(__file__).resolve().parent.glob("*.py"))
+
+
+@st.cache_resource(show_spinner="Loading recent events...", max_entries=1)
+def _build_aggregator(db_path, code_version):
     return Aggregator(db_path, window_hours=WINDOW_HOURS, history_days=HISTORY_DAYS)
+
+
+def get_aggregator(db_path):
+    agg = _build_aggregator(db_path, CODE_VERSION)
+    if not hasattr(agg, "events_frame"):      # object built before the last deploy
+        _build_aggregator.clear()
+        agg = _build_aggregator(db_path, CODE_VERSION)
+    if not hasattr(agg, "events_frame"):      # still missing: the file itself is old
+        st.error("src/wikeds/aggregator.py is out of date (no events_frame). "
+                 "Copy the latest aggregator.py into the repo, push, then reboot the app.")
+        st.stop()
+    return agg
 
 
 @st.cache_data(ttl=600, show_spinner=False)

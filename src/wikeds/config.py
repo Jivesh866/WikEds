@@ -10,7 +10,7 @@ from pathlib import Path
 
 try:
     from dotenv import load_dotenv
-    load_dotenv()  # no .env? fine, env vars still work
+    load_dotenv()  
 except ImportError:
     pass
 
