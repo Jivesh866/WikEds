@@ -1,0 +1,20 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    env:
+      SUPABASE_DB_URL: ""   # tests must never touch a real db
+      RUN_ENV: local
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.14"
+          enable-cache: true
+      - run: uv sync
+      - run: uv run pytest -q
