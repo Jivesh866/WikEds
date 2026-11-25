@@ -9,12 +9,15 @@ from zoneinfo import ZoneInfo
 import duckdb
 import pandas as pd
 
+from wikeds import config
+from wikeds.summary_store import open_store
+
 log = logging.getLogger("wiki-aggregator")
 
-DB_PATH = "wiki.db"
+DB_PATH = config.DB_PATH
 WINDOW_HOURS = 3          # how much recent raw data to keep in memory
 OVERLAP_SECONDS = 120     # re-read this much on each refresh to catch late events
-LOCAL_TZ = "Asia/Kolkata"
+LOCAL_TZ = config.TIMEZONE
 HISTORY_DAYS = 30         # how much of summary_hourly to keep in memory
 HISTORY_REFRESH_SECONDS = 60   # history changes slowly, so reload it at most this often
 
@@ -33,12 +36,13 @@ class Aggregator:
                  history_days=HISTORY_DAYS):
         if not Path(db_path).exists():
             raise FileNotFoundError(
-                f"{db_path} not found. Start listener.py first so it creates the database."
+                f"{db_path} not found. Start the listener first (uv run wikeds-listener) so it creates the database."
             )
         self.db_path = db_path
         self.window_seconds = int(window_hours * 3600)
         self.history_days = int(history_days)
         self._hist_checked = 0.0
+        self.history_error = None    # set when the summary store can't be read
         self._bucket_offset = None   # UTC offset the summary hours are aligned to (from summary_meta)
         self.tz = tz
         self._lock = threading.Lock()  # one DuckDB connection shared across threads
@@ -98,8 +102,8 @@ class Aggregator:
         n = self._refresh_recent()
         try:
             self.refresh_history()
-        except sqlite3.Error:
-            log.warning("could not refresh history from summary_hourly", exc_info=True)
+        except Exception:
+            log.warning("could not refresh history", exc_info=True)
         return n
 
     def _refresh_recent(self):
@@ -329,31 +333,19 @@ class Aggregator:
 
     # ------------------------------------------------------------------ history
     def _read_summary(self, since_hour):
-        cols = ["hour_start", "wiki", "type", "bot", "edits", "editors", "net_bytes"]
-        con = sqlite3.connect(self.db_path, timeout=30)
+        store = open_store()
         try:
-            con.execute("PRAGMA query_only = ON;")
-            exists = con.execute(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'summary_hourly'"
-            ).fetchone()
-            if not exists:  # database created before rollups existed
-                return pd.DataFrame(columns=cols)
-            row = con.execute(
-                "SELECT value FROM summary_meta WHERE key = 'bucket_offset'"
-            ).fetchone()
-            if row is not None:
-                self._bucket_offset = int(row[0])
-            return pd.read_sql_query(
-                f"SELECT {', '.join(cols)} FROM summary_hourly WHERE hour_start >= ?",
-                con, params=(since_hour,),
-            )
+            off = store.get_meta("bucket_offset")
+            if off is not None:
+                self._bucket_offset = int(off)
+            return store.read_hours(since_hour)
         finally:
-            con.close()
+            store.close()
 
     def refresh_history(self, force=False):
-        """Load new or changed rows of summary_hourly into memory.
+        """Load new or changed summary rows into memory.
 
-        Hours are final once rolled up, except the newest couple, which rollup.py
+        Hours are final once rolled up, except the newest couple, which the rollup
         keeps recomputing, so only hours from (newest cached - 2h) on are re-read.
         Throttled to once per HISTORY_REFRESH_SECONDS unless force=True.
         Returns the number of summary rows read.
@@ -361,11 +353,19 @@ class Aggregator:
         now = time.time()
         if not force and now - self._hist_checked < HISTORY_REFRESH_SECONDS:
             return 0
+        self._hist_checked = now   # also spaces out retries when the remote db is down
+        cutoff = (int(now) // 3600) * 3600 - self.history_days * 86400
         with self._lock:
-            cutoff = (int(now) // 3600) * 3600 - self.history_days * 86400
             last = self.con.execute("SELECT max(hour_start) FROM hist").fetchall()[0][0]
-            since = cutoff if last is None else max(cutoff, last - 2 * 3600)
-            df = self._read_summary(since)
+        since = cutoff if last is None else max(cutoff, last - 2 * 3600)
+        try:
+            df = self._read_summary(since)   # network call, so kept outside the lock
+        except Exception as e:
+            self.history_error = str(e).strip().splitlines()[0] if str(e).strip() else type(e).__name__
+            log.warning("could not read summaries: %s", e)
+            return 0
+        self.history_error = None
+        with self._lock:
             self.con.execute("DELETE FROM hist WHERE hour_start >= ?", [since])
             if len(df):
                 self.con.register("incoming_hist", df)
@@ -375,8 +375,7 @@ class Aggregator:
                 """)
                 self.con.unregister("incoming_hist")
             self.con.execute("DELETE FROM hist WHERE hour_start < ?", [cutoff])
-            self._hist_checked = now
-            return len(df)
+        return len(df)
 
     def _utc_offset(self):
         """UTC offset (seconds) that days and hours are cut on.

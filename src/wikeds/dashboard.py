@@ -1,14 +1,15 @@
 import inspect
-import os
+import threading
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from aggregator import HISTORY_DAYS, LOCAL_TZ, WINDOW_HOURS, Aggregator
+from wikeds import config, listener
+from wikeds.aggregator import HISTORY_DAYS, LOCAL_TZ, WINDOW_HOURS, Aggregator
 
-DB_DEFAULT = os.environ.get("WIKI_DB", "wiki.db")
-STALL_SECONDS = 120   # warn if nothing has been ingested for this long
+DB_DEFAULT = config.DB_PATH
+STALL_SECONDS = config.STALL_SECONDS   # warn if nothing ingested for this long
 
 st.set_page_config(page_title="Wikipedia live edits", layout="wide")
 
@@ -146,10 +147,11 @@ def live_panel(db_path, minutes, include_bots, wikis):
 
     age = health["newest_ingest_age_s"]
     if age is None:
-        st.info("No events yet. Start `listener.py` and give it a few seconds.")
+        st.info("No events yet. Give the listener a few seconds, or check its logs if this stays empty.")
         return
     if age > STALL_SECONDS:
-        st.warning(f"The listener looks stalled: the newest event was ingested {fmt_age(age)} ago.")
+        st.warning(f"The listener looks stalled: the newest event was ingested {fmt_age(age)} ago. "
+                   "Check the listener logs.")
     else:
         st.caption(f"Live: newest event ingested {fmt_age(age)} ago · "
                    f"{health['rows_cached']:,} events in memory · times in {LOCAL_TZ}")
@@ -209,11 +211,13 @@ def history_panel(db_path, include_bots, wikis):
     agg.refresh_history()
     c = palette()
     cov = agg.history_coverage()
+    if agg.history_error:
+        st.warning(f"Could not read the summary database, showing what is cached: {agg.history_error}")
 
     if cov["hours_with_data"] == 0:
         st.info("No history yet. The listener rolls raw events up into hourly summaries every "
                 "10 minutes, so this fills in shortly after the first full hour. To fill it "
-                "from existing data right away, run `python rollup.py`.")
+                "from existing data right away, run `python -m wikeds.rollup`.")
         return
 
     choices = [d for d in (1, 7, 14, 30) if d <= HISTORY_DAYS] or [HISTORY_DAYS]
@@ -284,6 +288,28 @@ def history_panel(db_path, include_bots, wikis):
 
 
 # ----------------------------------------------------------------- page
+config.setup_logging()
+
+
+@st.cache_resource
+def _listener_holder():
+    return {"thread": None, "lock": threading.Lock()}
+
+
+def ensure_listener():
+    """Embedded mode (Streamlit Cloud): keep a listener thread alive in this process."""
+    if not config.EMBED_LISTENER:
+        return
+    h = _listener_holder()
+    with h["lock"]:  # several sessions can hit this at once
+        t = h["thread"]
+        if t is None or not t.is_alive():
+            listener.open_db().close()  # make sure the db file exists first
+            h["thread"] = listener.start_in_thread()
+
+
+ensure_listener()
+
 st.title("Wikipedia live edits")
 
 st.sidebar.header("Controls")
@@ -301,12 +327,13 @@ include_bots = st.sidebar.checkbox("Include bots", value=True)
 wikis = st.sidebar.multiselect("Wikis (empty = all)", wiki_options(db_path))
 refresh_label = st.sidebar.selectbox("Auto-refresh", ["Off", "5 s", "10 s", "30 s"], index=2)
 interval = {"Off": None, "5 s": 5, "10 s": 10, "30 s": 30}[refresh_label]
-st.sidebar.caption(f"Live data: last {WINDOW_HOURS} hours of raw events. "
-                   f"History: hourly summaries, last {HISTORY_DAYS} days.")
+st.sidebar.caption(f"Live data: last {WINDOW_HOURS} hours of raw events (local disk). "
+                   f"History: hourly summaries from {'Supabase' if config.SUMMARY_DB_URL else 'the local file'}, "
+                   f"last {HISTORY_DAYS} days. Running as: {config.ENV_NAME}.")
 
 tab_live, tab_hist = st.tabs(["Live", "History"])
 with tab_live:
     # a fragment re-runs by itself every `interval` seconds without redrawing the whole page
     st.fragment(live_panel, run_every=interval)(db_path, minutes, include_bots, wikis)
 with tab_hist:
-    history_panel(db_path, include_bots, wikis) 
+    history_panel(db_path, include_bots, wikis)
