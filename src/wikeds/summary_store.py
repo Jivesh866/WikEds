@@ -84,9 +84,9 @@ class Store:
         connections at the same moment (listener + dashboard on startup), so check
         first and serialize the create with an advisory lock."""
         with _schema_lock:
-            if self.label in _schema_ready:
-                return
             is_pg = self.p != "?"
+            if is_pg and self.label in _schema_ready:   # sqlite create is already safe to repeat
+                return
             if is_pg and self._pg_tables_exist():
                 _schema_ready.add(self.label)
                 return
