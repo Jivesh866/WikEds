@@ -8,7 +8,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from wikeds import anomaly, config, listener
+from wikeds import anomaly, config, flag_review, listener
 from wikeds.aggregator import HISTORY_DAYS, LOCAL_TZ, WINDOW_HOURS, Aggregator
 
 DB_DEFAULT = config.DB_PATH
@@ -572,8 +572,8 @@ st.sidebar.caption(f"Live data: last {WINDOW_HOURS} hours of raw events (local d
                    f"History: hourly summaries from {'Supabase' if config.SUMMARY_DB_URL else 'the local file'}, "
                    f"last {HISTORY_DAYS} days. Running as: {config.ENV_NAME}.")
 
-tab_live, tab_hist, tab_anom, tab_wiki, tab_health = st.tabs(
-    ["Live", "History", "Anomalies", "Wiki", "Health"])
+tab_live, tab_hist, tab_anom, tab_flags, tab_wiki, tab_health = st.tabs(
+    ["Live", "History", "Anomalies", "Flags", "Wiki", "Health"])
 with tab_live:
     # a fragment re-runs by itself every `interval` seconds without redrawing the whole page
     st.fragment(live_panel, run_every=interval)(db_path, minutes, include_bots, wikis)
@@ -581,6 +581,8 @@ with tab_hist:
     history_panel(db_path, include_bots, wikis)
 with tab_anom:
     st.fragment(anomalies_panel, run_every=interval)(db_path, wikis)
+with tab_flags:
+    st.fragment(flag_review.flags_panel)()   # no auto-refresh, so labeling isn't interrupted
 with tab_wiki:
     st.fragment(wiki_panel, run_every=interval)(db_path, minutes, include_bots)
 with tab_health:

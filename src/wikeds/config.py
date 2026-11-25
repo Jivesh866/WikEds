@@ -67,6 +67,13 @@ CONNECT_TIMEOUT = _int("CONNECT_TIMEOUT", 10, 10)
 READ_TIMEOUT = _int("READ_TIMEOUT", 60, 60)
 MAX_BACKOFF = _int("MAX_BACKOFF", 60, 60)
 
+# ---- anomaly flags ----
+# the listener runs the detectors on its own and saves what they find
+DETECT_ENABLED = _bool("DETECT_ENABLED", True, True)
+DETECT_EVERY_SECONDS = _int("DETECT_EVERY_SECONDS", 60, 60)
+FLAG_RETENTION_DAYS = _int("FLAG_RETENTION_DAYS", 90, 90)
+EPISODE_GAP_SECONDS = _int("EPISODE_GAP_SECONDS", 1800, 1800)   # quiet this long = next flag is a new episode
+
 # ---- dashboard ----
 TIMEZONE = os.getenv("WIKI_TZ", "Asia/Kolkata")
 STALL_SECONDS = _int("STALL_SECONDS", 120, 120)
