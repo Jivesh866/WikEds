@@ -60,12 +60,3 @@ Any env var overrides these. If detection ever guesses wrong, set `RUN_ENV=cloud
 
 Idle apps sleep, and the listener sleeps with them, so expect gaps in History.
 Hours that were only partly observed (restarts) keep their highest count, they never shrink.
-
-## Is it stalled?
-
-The Live tab shows how long ago the newest event was ingested and turns into a warning
-after `STALL_SECONDS` (default 120). The listener logs a stats line every minute.
-
-## Config
-
-All settings are env vars, see `.env.example`.

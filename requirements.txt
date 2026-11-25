@@ -1,0 +1,7 @@
+streamlit>=1.37
+pandas
+plotly
+duckdb
+requests
+python-dotenv
+psycopg[binary]>=3.1
