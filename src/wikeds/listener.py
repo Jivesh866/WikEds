@@ -8,12 +8,13 @@ from pathlib import Path
 
 import requests
 
-from wikeds import config, rollup
+from wikeds import config, detector, flags, rollup
 from wikeds.summary_store import open_store
 
 log = logging.getLogger("wiki-listener")
 
 DELETE_CHUNK = 50_000  # rows per delete, keeps write locks short
+FLAG_PRUNE_EVERY = 3600  # how often old flags are deleted
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS edits (
@@ -85,6 +86,9 @@ class Listener:
         self.last_flush = time.time()
         self.last_cleanup = 0.0
         self.maint_thread = None
+        self.last_detect = time.time()   # first check after one interval
+        self.detect_thread = None
+        self.last_flag_prune = 0.0
         self.last_stats = time.time()
         self.seen = 0      # received since last stats line
         self.skipped = 0   # junk since last stats line
@@ -159,6 +163,51 @@ class Listener:
             if store is not None:
                 store.close()
 
+    def maybe_detect(self):
+        if not config.DETECT_ENABLED:
+            return
+        now = time.time()
+        if now - self.last_detect < config.DETECT_EVERY_SECONDS:
+            return
+        if self.detect_thread is not None and self.detect_thread.is_alive():
+            return  # last check still running
+        self.last_detect = now
+        self.detect_thread = threading.Thread(
+            target=self._detect, name="detector", daemon=True
+        )
+        self.detect_thread.start()
+
+    def _detect(self):
+        """Run the anomaly detectors and save what they find. Own thread + own connections.
+
+        The summary store is only opened when there is something to write, so a
+        quiet minute costs no remote round trip.
+        """
+        con = store = None
+        try:
+            con = sqlite3.connect(config.DB_PATH, timeout=30)
+            found = detector.detect(con)
+            prune_due = time.time() - self.last_flag_prune >= FLAG_PRUNE_EVERY
+            if not found and not prune_due:
+                return
+            store = open_store()
+            if found:
+                new, updated = flags.save(store, found, int(time.time()))
+                log.info("flags: %d new, %d updated", new, updated)
+            if prune_due:
+                cutoff = int(time.time() - config.FLAG_RETENTION_DAYS * 86400)
+                gone = flags.prune(store, cutoff)
+                self.last_flag_prune = time.time()
+                if gone:
+                    log.info("flag retention removed %d old flags", gone)
+        except Exception:
+            log.exception("detector failed")
+        finally:
+            if con is not None:
+                con.close()
+            if store is not None:
+                store.close()
+
     def maybe_log_stats(self):
         now = time.time()
         if now - self.last_stats < config.STATS_EVERY_SECONDS:
@@ -201,6 +250,7 @@ class Listener:
                         or time.time() - self.last_flush >= config.FLUSH_SECONDS):
                     self.flush()
                 self.maybe_maintenance()
+                self.maybe_detect()
                 self.maybe_log_stats()
 
     def run(self, install_signals=True):
