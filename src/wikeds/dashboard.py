@@ -326,7 +326,12 @@ def health_panel(db_path):
     thread = _listener_holder()["thread"] if config.EMBED_LISTENER else None
     thread_ok = thread is not None and thread.is_alive()
 
+    jobs = listener.STATUS if config.EMBED_LISTENER else {}
     problems = []
+    for name, label in (("rollup", "The rollup job"), ("detect", "The anomaly detector")):
+        j = jobs.get(name)
+        if j and not j["ok"]:
+            problems.append(f"{label} failed {age_text(time.time() - j['at'])}: {j['err']}")
     if age is None:
         problems.append("No events ingested yet.")
     elif age > STALL_SECONDS:
@@ -371,6 +376,18 @@ def health_panel(db_path):
         listener_txt = "separate process"
     else:
         listener_txt = "embedded thread, " + ("running" if thread_ok else "NOT running")
+    def job_text(name, detail):
+        if not config.EMBED_LISTENER:
+            return "separate process, see its log"
+        j = jobs.get(name)
+        if not j:
+            return "has not run yet since the app started"
+        when = age_text(time.time() - j["at"])
+        return f"ran {when}, {detail(j)}" if j["ok"] else f"FAILED {when}: {j['err']}"
+
+    rollup_txt = job_text("rollup", lambda j: f"{j['rows']:,} rows written" if j["through"] else "no raw data yet")
+    detect_txt = ("switched off" if not config.DETECT_ENABLED else
+                  job_text("detect", lambda j: f"{j['found']} candidate(s) found"))
     status = pd.DataFrame([
         ("Environment", config.ENV_NAME),
         ("Listener", listener_txt),
@@ -378,6 +395,8 @@ def health_panel(db_path):
         ("Summary store", ss["source"]),
         ("Last summary read", read_txt),
         ("Last rollup", age_text(rollup_age)),
+        ("Rollup job", rollup_txt),
+        ("Anomaly detector", detect_txt),
         ("Summaries final through", f"{rolled_txt} ({LOCAL_TZ})"),
     ], columns=["item", "status"])
     st.subheader("Pipeline status")

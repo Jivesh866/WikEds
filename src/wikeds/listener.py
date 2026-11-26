@@ -14,6 +14,20 @@ from wikeds.summary_store import open_store
 log = logging.getLogger("wiki-listener")
 
 DELETE_CHUNK = 50_000  # rows per delete, keeps write locks short
+
+# what the background jobs last did, so the Health tab can show errors without digging in logs.
+# only visible to the dashboard when the listener runs inside it (embedded / cloud mode)
+STATUS = {"rollup": {}, "detect": {}}
+
+
+def _note(job, ok, err=None, **info):
+    STATUS[job] = {"at": time.time(), "ok": ok, "err": err, **info}
+
+
+def _err(e):
+    first = (str(e).strip().splitlines() or [""])[0]
+    return f"{type(e).__name__}: {first}"[:200]
+
 FLAG_PRUNE_EVERY = 3600  # how often old flags are deleted
 
 SCHEMA = """
@@ -84,7 +98,7 @@ class Listener:
         self.buffer = []
         self.stop = False
         self.last_flush = time.time()
-        self.last_cleanup = 0.0
+        self.last_cleanup = time.time() - config.CLEANUP_EVERY_SECONDS + 60   # first run after ~60 s
         self.maint_thread = None
         self.last_detect = time.time()   # first check after one interval
         self.detect_thread = None
@@ -137,6 +151,7 @@ class Listener:
             stats = rollup.run_rollup(con, store)
             log.info("rollup: wrote %d summary rows (final through %s)",
                      stats["rows_written"], stats["rolled_through"])
+            _note("rollup", True, rows=stats["rows_written"], through=stats["rolled_through"])
 
             pruned = rollup.prune_summary(store)
             if pruned:
@@ -156,7 +171,8 @@ class Listener:
                     break
             if deleted:
                 log.info("cleanup removed %d old raw rows", deleted)
-        except Exception:
+        except Exception as e:
+            _note("rollup", False, err=_err(e))
             log.exception("maintenance failed, raw rows kept")
         finally:
             if con is not None:
@@ -188,6 +204,7 @@ class Listener:
         try:
             con = sqlite3.connect(config.DB_PATH, timeout=30)
             found = detector.detect(con)
+            _note("detect", True, found=len(found))
             prune_due = time.time() - self.last_flag_prune >= FLAG_PRUNE_EVERY
             if not found and not prune_due and not self.alert_retry:
                 return
@@ -204,7 +221,8 @@ class Listener:
                 self.last_flag_prune = time.time()
                 if gone:
                     log.info("flag retention removed %d old flags", gone)
-        except Exception:
+        except Exception as e:
+            _note("detect", False, err=_err(e))
             log.exception("detector failed")
         finally:
             if con is not None:
