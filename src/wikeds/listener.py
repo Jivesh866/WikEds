@@ -8,7 +8,7 @@ from pathlib import Path
 
 import requests
 
-from wikeds import config, detector, flags, rollup
+from wikeds import alerts, config, detector, flags, rollup
 from wikeds.summary_store import open_store
 
 log = logging.getLogger("wiki-listener")
@@ -89,6 +89,7 @@ class Listener:
         self.last_detect = time.time()   # first check after one interval
         self.detect_thread = None
         self.last_flag_prune = 0.0
+        self.alert_retry = False   # last discord post failed, try again next check
         self.last_stats = time.time()
         self.seen = 0      # received since last stats line
         self.skipped = 0   # junk since last stats line
@@ -188,15 +189,18 @@ class Listener:
             con = sqlite3.connect(config.DB_PATH, timeout=30)
             found = detector.detect(con)
             prune_due = time.time() - self.last_flag_prune >= FLAG_PRUNE_EVERY
-            if not found and not prune_due:
+            if not found and not prune_due and not self.alert_retry:
                 return
             store = open_store()
             if found:
                 new, updated = flags.save(store, found, int(time.time()))
                 log.info("flags: %d new, %d updated", new, updated)
+            if config.DISCORD_WEBHOOK_URL:
+                self._alert(store)
             if prune_due:
                 cutoff = int(time.time() - config.FLAG_RETENTION_DAYS * 86400)
                 gone = flags.prune(store, cutoff)
+                alerts.prune(store, cutoff)
                 self.last_flag_prune = time.time()
                 if gone:
                     log.info("flag retention removed %d old flags", gone)
@@ -207,6 +211,17 @@ class Listener:
                 con.close()
             if store is not None:
                 store.close()
+
+    def _alert(self, store):
+        """Send new alerts. A failure here must not stop flag saving or pruning."""
+        try:
+            sent, failed = alerts.send_new(store)
+            self.alert_retry = failed
+            if sent:
+                log.info("alerts: sent %d discord message(s)", sent)
+        except Exception:
+            self.alert_retry = False
+            log.exception("sending alerts failed")
 
     def maybe_log_stats(self):
         now = time.time()

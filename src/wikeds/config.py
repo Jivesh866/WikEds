@@ -74,6 +74,11 @@ DETECT_EVERY_SECONDS = _int("DETECT_EVERY_SECONDS", 60, 60)
 FLAG_RETENTION_DAYS = _int("FLAG_RETENTION_DAYS", 90, 90)
 EPISODE_GAP_SECONDS = _int("EPISODE_GAP_SECONDS", 1800, 1800)   # quiet this long = next flag is a new episode
 
+# ---- alerts ----
+# empty = no alerts. Keep it in secrets / .env, never in git.
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+ALERTS_PER_HOUR = _int("ALERTS_PER_HOUR", 10, 10)   # 0 = no limit
+
 # ---- dashboard ----
 TIMEZONE = os.getenv("WIKI_TZ", "Asia/Kolkata")
 STALL_SECONDS = _int("STALL_SECONDS", 120, 120)
@@ -104,6 +109,8 @@ def setup_logging():
         "environment=%s raw_db=%s summaries=%s embed_listener=%s",
         ENV_NAME, DB_PATH, "supabase" if SUMMARY_DB_URL else "local sqlite", EMBED_LISTENER,
     )
+    logging.getLogger("wiki-config").info(
+        "discord alerts: %s", "on" if DISCORD_WEBHOOK_URL else "off (no DISCORD_WEBHOOK_URL)")
     if IS_CLOUD and not SUMMARY_DB_URL:
         logging.getLogger("wiki-config").warning(
             "on cloud without SUPABASE_DB_URL: summaries will be lost on restart")
