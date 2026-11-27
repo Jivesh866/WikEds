@@ -74,10 +74,17 @@ DETECT_EVERY_SECONDS = _int("DETECT_EVERY_SECONDS", 60, 60)
 FLAG_RETENTION_DAYS = _int("FLAG_RETENTION_DAYS", 90, 90)
 EPISODE_GAP_SECONDS = _int("EPISODE_GAP_SECONDS", 1800, 1800)   # quiet this long = next flag is a new episode
 
+# vandalism detector: main-namespace pages only, and skip wikis where emptying a page is routine
+VANDALISM_ARTICLES_ONLY = _bool("VANDALISM_ARTICLES_ONLY", True, True)
+_skip = os.getenv("VANDALISM_SKIP_WIKIS")
+VANDALISM_SKIP_WIKIS = tuple(w.strip() for w in
+                             ("wikidatawiki,commonswiki" if _skip is None else _skip).split(",") if w.strip())
+
 # ---- alerts ----
 # empty = no alerts. Keep it in secrets / .env, never in git.
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
-ALERTS_PER_HOUR = _int("ALERTS_PER_HOUR", 10, 10)   # 0 = no limit
+ALERTS_PER_HOUR = _int("ALERTS_PER_HOUR", 10, 10)   # news bursts, 0 = no limit
+BLANKED_ALERTS_PER_HOUR = _int("BLANKED_ALERTS_PER_HOUR", 3, 3)   # blanked pages, 0 = no limit
 
 # ---- dashboard ----
 TIMEZONE = os.getenv("WIKI_TZ", "Asia/Kolkata")

@@ -8,7 +8,7 @@ import time
 
 import pandas as pd
 
-from wikeds import anomaly
+from wikeds import anomaly, config
 
 log = logging.getLogger("wiki-detector")
 
@@ -47,7 +47,9 @@ def collect(df, now):
         add("burst", r["wiki"], r["title"], r["title"], "",
             f"{r['edits']} edits by {r['editors']} editors, about {r['expected']} expected",
             r["z"], r["edits"], r["editors"], r["net_bytes"])
-    for r in anomaly.suspicious_edits(df, now).to_dict("records"):
+    sus = anomaly.suspicious_edits(df, now, articles_only=config.VANDALISM_ARTICLES_ONLY,
+                                   skip_wikis=config.VANDALISM_SKIP_WIKIS)
+    for r in sus.to_dict("records"):
         add("vandalism", r["wiki"], f"{r['title']}|{r['user']}|{r['edit_time']}", r["title"],
             r["user"], r["reason"], r["z"], 1, 1, r["bytes_changed"])
     for r in anomaly.rate_spikes(df, now).to_dict("records"):

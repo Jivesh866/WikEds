@@ -37,7 +37,7 @@ class Fake:
 def test_only_bursts_and_blanked_pages_alert_and_only_once():
     s, post = mem_store(), Fake()
     flags.save(s, [flag(subject="Breaking"),
-                   flag("vandalism", "Gone", "page blanked", "vandal", -5000),
+                   flag("vandalism", "Gone", "page blanked", "203.0.113.7", -5000),
                    flag("vandalism", "Cut|e|1", "large removal"),
                    flag("spike", "")], NOW)
     assert alerts.send_new(s, NOW, URL, 10, post) == (2, False)
@@ -103,3 +103,22 @@ def test_old_alert_log_rows_are_pruned():
     flags.save(s, [flag()], NOW)
     alerts.send_new(s, NOW, URL, 10, Fake())
     assert alerts.prune(s, NOW + 10) == 1
+
+
+def test_blanked_page_by_registered_editor_does_not_alert():
+    s, post = mem_store(), Fake()
+    flags.save(s, [flag("vandalism", "Moved", "page blanked", "RealEditor", -5000),
+                   flag("vandalism", "Spam", "page blanked", "2001:db8::1", -3000)], NOW)
+    assert alerts.send_new(s, NOW, URL, 10, post) == (1, False)
+    assert post.calls[0]["embeds"][0]["title"] == "Page blanked: Spam"
+    assert alerts.send_new(s, NOW + 60, URL, 10, post) == (0, False)    # the skipped one stays quiet
+
+
+def test_blanked_and_burst_budgets_are_separate():
+    s, post = mem_store(), Fake()
+    flags.save(s, [flag("vandalism", f"B{i}", "page blanked", f"203.0.113.{i}", -4000) for i in range(5)]
+               + [flag(subject="Breaking")], NOW)
+    assert alerts.send_new(s, NOW, URL, 10, post, blank_limit=2) == (3, False)   # 2 blanked + the burst
+    texts = [c.get("content") or c["embeds"][0]["title"] for c in post.calls]
+    assert "News burst: Breaking" in texts
+    assert any("3 more blanked page" in t for t in texts)

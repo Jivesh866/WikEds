@@ -115,17 +115,24 @@ def page_bursts(df, now, recent_min=15, baseline_min=120, min_baseline_min=30,
     return g[BURST_COLS].sort_values("z", ascending=False, ignore_index=True)
 
 
-def suspicious_edits(df, now, minutes=60, min_z=6.0, min_bytes=2000, min_samples=30):
+def suspicious_edits(df, now, minutes=60, min_z=6.0, min_bytes=2000, min_samples=30,
+                     articles_only=False, skip_wikis=()):
     """Human edits that are way outside the normal edit size for their wiki.
 
     Robust z-score (median / MAD, so the outliers don't skew their own baseline).
     Flags: page blanked, large removal, large addition by an anonymous editor.
     Blanking doesn't need the z-score, so it also works on quiet wikis.
+    articles_only / skip_wikis cut out user pages, project pages and wikis like Wikidata,
+    where emptying a page is usually a merge or an archive, not vandalism.
     """
     if df.empty:
         return _empty(SUS_COLS)
     d = df[(df["bot"] == 0) & (df["type"] == "edit")
            & (df["event_time"] >= int(now) - minutes * 60)].copy()
+    if articles_only and "namespace" in d:
+        d = d[pd.to_numeric(d["namespace"], errors="coerce").fillna(-1) == 0]
+    if len(skip_wikis):
+        d = d[~d["wiki"].isin(list(skip_wikis))]
     d["old"], d["new"] = _num(d["old_len"]).fillna(0), _num(d["new_len"])
     d = d[d["new"].notna()]
     if d.empty:

@@ -414,7 +414,9 @@ def find_anomalies(db_path, spike_z, burst_editors, min_bytes):
     return {
         "spikes": anomaly.rate_spikes(df, now, min_z=spike_z),
         "bursts": anomaly.page_bursts(df, now, min_editors=burst_editors),
-        "suspicious": anomaly.suspicious_edits(df, now, min_bytes=min_bytes),
+        "suspicious": anomaly.suspicious_edits(
+            df, now, min_bytes=min_bytes, articles_only=config.VANDALISM_ARTICLES_ONLY,
+            skip_wikis=config.VANDALISM_SKIP_WIKIS),
         "servers": df.drop_duplicates("wiki").set_index("wiki")["server_name"].to_dict(),
         "have_min": 0 if df.empty else (now - df["event_time"].min()) / 60,
     }
@@ -474,7 +476,11 @@ def anomalies_panel(db_path, wikis):
 
     st.subheader("Possible vandalism")
     st.caption("Blanked pages, big removals, and big additions by anonymous (IP) editors in the "
-               "last hour. A big removal can be a legitimate cleanup, so check the page history.")
+               "last hour. A big removal can be a legitimate cleanup, so check the page history."
+               + (" Only articles are checked" if config.VANDALISM_ARTICLES_ONLY else "")
+               + (f", and {', '.join(config.VANDALISM_SKIP_WIKIS)} {'is' if len(config.VANDALISM_SKIP_WIKIS) == 1 else 'are'} skipped."
+                  if config.VANDALISM_SKIP_WIKIS and config.VANDALISM_ARTICLES_ONLY else
+                  ("." if config.VANDALISM_ARTICLES_ONLY else "")))
     if sus.empty:
         st.caption("Nothing unusual right now.")
     else:

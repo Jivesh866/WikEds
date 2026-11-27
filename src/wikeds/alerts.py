@@ -11,6 +11,7 @@ nothing happens.
 Test your webhook:  uv run python -m wikeds.alerts
 """
 import logging
+import re
 import threading
 import time
 from datetime import datetime, timezone
@@ -18,12 +19,13 @@ from urllib.parse import quote
 
 import requests
 
-from wikeds import config, flags
+from wikeds import anomaly, config, flags
 
 log = logging.getLogger("wiki-alerts")
 
 LOOKBACK = 3600           # flags older than this are too stale to alert on
 BLANKED = "page blanked"  # reason text from anomaly.suspicious_edits
+KINDS = (("burst", "news burst"), ("vandalism", "blanked page"))
 COLORS = {"burst": 0xEB6834, "vandalism": 0xD03030}
 
 _lock = threading.Lock()
@@ -48,7 +50,8 @@ _COLS = ["flag_id", "kind", "wiki", "title", "editor", "server", "reason", "peak
          "edits", "editors", "bytes_changed", "first_seen"]
 _MARK = ("INSERT INTO alert_log (flag_id, sent_at, delivered) VALUES ({p}, {p}, {p}) "
          "ON CONFLICT (flag_id) DO NOTHING")
-_RECENT = "SELECT COUNT(*) FROM alert_log WHERE sent_at >= {p} AND delivered = 1"
+_RECENT = ("SELECT COUNT(*) FROM alert_log WHERE sent_at >= {p} AND delivered = 1 "
+           "AND flag_id LIKE {p}")   # flag ids start with the kind
 
 
 def ensure_schema(store):
@@ -132,51 +135,67 @@ def _post(url, body, post):
 
 
 # ---------------------------------------------------------------- sending
-def send_new(store, now=None, url=None, limit=None, post=None):
+def _wanted(row):
+    """Blanked pages alert only for anonymous (IP) editors. A registered editor emptying a
+    page is usually a redirect or a move, which floods the channel."""
+    if row["kind"] != "vandalism":
+        return True
+    return bool(re.match(anomaly._IP, str(row["editor"] or "")))
+
+
+def send_new(store, now=None, url=None, limit=None, post=None, blank_limit=None):
     """Send alerts for flags that haven't been alerted yet.
 
-    Returns (messages sent, failed). On the first failure it stops and leaves the
-    rest unmarked, so the next run retries them.
+    News bursts and blanked pages each have their own hourly budget, so a flood of
+    one kind can't use up the other's. Returns (messages sent, failed). On the first
+    failure it stops and leaves the rest unmarked, so the next run retries them.
     """
     url = config.DISCORD_WEBHOOK_URL if url is None else url
     if not url:
         return 0, False
     post = requests.post if post is None else post
-    limit = config.ALERTS_PER_HOUR if limit is None else int(limit)
+    limits = {"burst": config.ALERTS_PER_HOUR if limit is None else int(limit),
+              "vandalism": config.BLANKED_ALERTS_PER_HOUR if blank_limit is None else int(blank_limit)}
     now = int(time.time() if now is None else now)
 
     flags.ensure_schema(store)
     ensure_schema(store)
     rows = [dict(zip(_COLS, r)) for r in
             store._exec(_PENDING, (now - LOOKBACK, BLANKED)).fetchall()]
+    rows = [r for r in rows if _wanted(r)]
     if not rows:
         return 0, False
-
-    recent = store._exec(_RECENT, (now - 3600,)).fetchone()[0]
-    budget = None if limit <= 0 else max(limit - int(recent), 0)
 
     def mark(flag_id, delivered):
         with store._tx():
             store._exec(_MARK, (flag_id, now, delivered))
 
-    sent = 0
-    for i, row in enumerate(rows):
-        if budget is not None and sent >= budget:
-            rest = rows[i:]
-            body = {"username": "wikeds", "allowed_mentions": {"parse": []},
-                    "content": f"{len(rest)} more flag(s) were not sent because of the limit of "
-                               f"{limit} alerts per hour. See the Flags tab."}
-            if _post(url, body, post):
+    total = 0
+    for kind, noun in KINDS:
+        mine = [r for r in rows if r["kind"] == kind]
+        if not mine:
+            continue
+        cap = limits[kind]
+        recent = store._exec(_RECENT, (now - 3600, kind + "|%")).fetchone()[0]
+        budget = None if cap <= 0 else max(cap - int(recent), 0)
+        sent = 0
+        for i, row in enumerate(mine):
+            if budget is not None and sent >= budget:
+                rest = mine[i:]
+                body = {"username": "wikeds", "allowed_mentions": {"parse": []},
+                        "content": f"{len(rest)} more {noun} flag(s) were not sent because of the limit "
+                                   f"of {cap} per hour. See the Flags tab."}
+                if not _post(url, body, post):
+                    return total, True
                 for r in rest:
                     mark(r["flag_id"], 0)
-            else:
-                return sent, True
-            break
-        if not _post(url, build_message(row), post):
-            return sent, True
-        mark(row["flag_id"], 1)
-        sent += 1
-    return sent, False
+                break
+            if not _post(url, build_message(row), post):
+                return total, True
+            mark(row["flag_id"], 1)
+            sent += 1
+            total += 1
+    return total, False
 
 
 def _main():
