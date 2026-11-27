@@ -13,6 +13,9 @@ Needs some history to compare against, so nothing fires until there are
 import numpy as np
 import pandas as pd
 
+# edit summaries that say the edit undoes someone else's (rollback, undo, "Reverted edits by ...")
+_REVERT = r"(?i)\b(?:revert\w*|undid|undo\w*|rvv?|rollback\w*)\b"
+
 # logged-out editors show up as an IP address
 _IP = r"^(?:\d{1,3}(?:\.\d{1,3}){3}|[0-9A-Fa-f]*:[0-9A-Fa-f:]+)$"
 
@@ -28,6 +31,11 @@ def _empty(cols):
 def _num(s):
     """Nullable ints -> plain floats (NA becomes NaN)."""
     return pd.to_numeric(s, errors="coerce").astype("float64")
+
+
+def is_revert(comments):
+    """True where the edit summary looks like a revert or undo."""
+    return comments.fillna("").astype(str).str.contains(_REVERT, regex=True)
 
 
 def is_anon(users):
@@ -116,12 +124,14 @@ def page_bursts(df, now, recent_min=15, baseline_min=120, min_baseline_min=30,
 
 
 def suspicious_edits(df, now, minutes=60, min_z=6.0, min_bytes=2000, min_samples=30,
-                     articles_only=False, skip_wikis=()):
+                     articles_only=False, skip_wikis=(), skip_reverts=False, keep=()):
     """Human edits that are way outside the normal edit size for their wiki.
 
     Robust z-score (median / MAD, so the outliers don't skew their own baseline).
     Flags: page blanked, large removal, large addition by an anonymous editor.
     Blanking doesn't need the z-score, so it also works on quiet wikis.
+    skip_reverts drops edits whose own summary says revert/undo: that is someone cleaning up,
+    not vandalism. keep= names extra input columns (revision ids, comment) to pass through.
     articles_only / skip_wikis cut out user pages, project pages and wikis like Wikidata,
     where emptying a page is usually a merge or an archive, not vandalism.
     """
@@ -153,8 +163,10 @@ def suspicious_edits(df, now, minutes=60, min_z=6.0, min_bytes=2000, min_samples
                             ["page blanked", "large removal", "large addition by anonymous"],
                             default="")
     d = d[d["reason"] != ""]
+    if skip_reverts and "comment" in d:
+        d = d[~is_revert(d["comment"])]
     if d.empty:
-        return _empty(SUS_COLS)
+        return _empty(SUS_COLS + list(keep))
     d = d.assign(bytes_changed=d["delta"].astype("int64"), z=d["z"].round(1), edit_time=d["event_time"])
     order = d["bytes_changed"].abs().sort_values(ascending=False).index
-    return d.loc[order, SUS_COLS].reset_index(drop=True)
+    return d.loc[order, SUS_COLS + [c for c in keep if c in d.columns]].reset_index(drop=True)

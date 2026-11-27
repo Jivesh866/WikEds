@@ -14,7 +14,7 @@ def test_events_frame_and_top_editors(tmp_path, monkeypatch):
     now = int(time.time())
 
     def r(i, t, user, bot, title, new):
-        return (f"id{i}", t, t, "enwiki", "en.wikipedia.org", "edit", title, user, bot, 0, 0, 100, new)
+        return (f"id{i}", t, t, "enwiki", "en.wikipedia.org", "edit", title, user, bot, 0, 0, 100, new, None, None, None)
 
     raw.executemany(listener.INSERT_SQL, [
         r(0, now - 10, "alice", 0, "A", 160), r(1, now - 20, "alice", 0, "B", 90),

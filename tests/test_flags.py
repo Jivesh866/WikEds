@@ -81,9 +81,9 @@ def test_detector_collect_returns_plain_types():
     con = sqlite3.connect(":memory:")
     con.executescript(listener.SCHEMA)
     rows = [("filler", NOW - 7200, NOW - 7200, "enwiki", "en.wikipedia.org", "edit", "Filler",
-             "x", 0, 0, 0, 100, 110)]
+             "x", 0, 0, 0, 100, 110, None, None, None)]
     rows += [(f"b{i}", NOW - 600 + i * 10, NOW - 600 + i * 10, "enwiki", "en.wikipedia.org",
-              "edit", "Breaking", f"u{i % 6}", 0, 0, 0, 100, 110) for i in range(10)]
+              "edit", "Breaking", f"u{i % 6}", 0, 0, 0, 100, 110, None, None, None) for i in range(10)]
     con.executemany(listener.INSERT_SQL, rows)
     con.commit()
 

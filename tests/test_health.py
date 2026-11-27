@@ -15,7 +15,7 @@ def test_ingest_health_and_summary_status(tmp_path, monkeypatch):
     now = int(time.time())
     # event happened 30s before we ingested it, 20 events arriving ~100-120s ago
     rows = [(f"id{i}", now - 130 - i, now - 100 - i, "enwiki", "en.wikipedia.org",
-             "edit", "P", "u", 0, 0, 0, 10, 20) for i in range(20)]
+             "edit", "P", "u", 0, 0, 0, 10, 20, None, None, None) for i in range(20)]
     raw.executemany(listener.INSERT_SQL, rows)
     raw.commit()
 

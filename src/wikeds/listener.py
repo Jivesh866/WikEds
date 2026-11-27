@@ -21,7 +21,14 @@ STATUS = {"rollup": {}, "detect": {}}
 
 
 def _note(job, ok, err=None, **info):
-    STATUS[job] = {"at": time.time(), "ok": ok, "err": err, **info}
+    now = time.time()
+    last_ok = now if ok else STATUS[job].get("ok_at")     # when it last worked, for the watchdog
+    STATUS[job] = {"at": now, "ok": ok, "err": err, "ok_at": last_ok, **info}
+
+
+def _dur(seconds):
+    s = int(max(seconds, 0))
+    return f"{s} s" if s < 90 else f"{s // 60} min" if s < 7200 else f"{s // 3600} h"
 
 
 def _err(e):
@@ -29,6 +36,7 @@ def _err(e):
     return f"{type(e).__name__}: {first}"[:200]
 
 FLAG_PRUNE_EVERY = 3600  # how often old flags are deleted
+WATCHDOG_EVERY = 30      # seconds between outage checks
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS edits (
@@ -44,7 +52,10 @@ CREATE TABLE IF NOT EXISTS edits (
     minor       INTEGER,            -- 0/1
     namespace   INTEGER,
     old_len     INTEGER,
-    new_len     INTEGER
+    new_len     INTEGER,
+    rev_new     INTEGER,            -- revision ids, for diff links
+    rev_old     INTEGER,
+    comment     TEXT                -- edit summary, cut to 300 chars
 );
 CREATE INDEX IF NOT EXISTS idx_edits_time ON edits (event_time);
 CREATE INDEX IF NOT EXISTS idx_edits_wiki_time ON edits (wiki, event_time);
@@ -53,8 +64,8 @@ CREATE INDEX IF NOT EXISTS idx_edits_wiki_time ON edits (wiki, event_time);
 INSERT_SQL = """
 INSERT OR IGNORE INTO edits
     (event_id, event_time, ingested_at, wiki, server_name, type, title,
-     user, bot, minor, namespace, old_len, new_len)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     user, bot, minor, namespace, old_len, new_len, rev_new, rev_old, comment)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 
@@ -64,6 +75,15 @@ def open_db():
     con.execute("PRAGMA journal_mode=WAL;")
     con.execute("PRAGMA synchronous=NORMAL;")
     con.executescript(SCHEMA)
+    # a db made by an older version (local runs keep it) gets the newer columns
+    have = {r[1] for r in con.execute("PRAGMA table_info(edits)")}
+    for name, decl in (("rev_new", "INTEGER"), ("rev_old", "INTEGER"), ("comment", "TEXT")):
+        if name not in have:
+            try:
+                con.execute(f"ALTER TABLE edits ADD COLUMN {name} {decl}")
+            except sqlite3.OperationalError:
+                pass   # another process added it a moment ago
+    con.commit()
     return con
 
 
@@ -75,6 +95,8 @@ def parse_event(event):
     if not event_id or ts is None:
         return None
     length = event.get("length") or {}
+    rev = event.get("revision") or {}
+    comment = (event.get("comment") or "")[:300] or None
     return (
         event_id,
         int(ts),
@@ -89,6 +111,9 @@ def parse_event(event):
         event.get("namespace"),
         length.get("old"),
         length.get("new"),
+        rev.get("new"),
+        rev.get("old"),
+        comment,
     )
 
 
@@ -104,6 +129,10 @@ class Listener:
         self.detect_thread = None
         self.last_flag_prune = 0.0
         self.alert_retry = False   # last discord post failed, try again next check
+        self.started_at = time.time()
+        self.last_event_at = time.time()   # last line seen on the stream, for the stall check
+        self.problems = {}                 # open outage -> (since, last message time)
+        self.watchdog_thread = None
         self.last_stats = time.time()
         self.seen = 0      # received since last stats line
         self.skipped = 0   # junk since last stats line
@@ -204,9 +233,9 @@ class Listener:
         try:
             con = sqlite3.connect(config.DB_PATH, timeout=30)
             found = detector.detect(con)
-            _note("detect", True, found=len(found))
             prune_due = time.time() - self.last_flag_prune >= FLAG_PRUNE_EVERY
             if not found and not prune_due and not self.alert_retry:
+                _note("detect", True, found=0)
                 return
             store = open_store()
             if found:
@@ -221,6 +250,7 @@ class Listener:
                 self.last_flag_prune = time.time()
                 if gone:
                     log.info("flag retention removed %d old flags", gone)
+            _note("detect", True, found=len(found))
         except Exception as e:
             _note("detect", False, err=_err(e))
             log.exception("detector failed")
@@ -241,6 +271,64 @@ class Listener:
             self.alert_retry = False
             log.exception("sending alerts failed")
 
+    # ------------------------------------------------------------ outage watchdog
+    def start_watchdog(self):
+        """Own thread, so it still reports when the stream loop is stuck. Needs the webhook only."""
+        if not (config.DISCORD_WEBHOOK_URL and config.OUTAGE_ALERTS):
+            return
+        self.watchdog_thread = threading.Thread(target=self._watchdog, name="watchdog", daemon=True)
+        self.watchdog_thread.start()
+
+    def _watchdog(self):
+        if config.START_NOTICE:
+            alerts.send_notice(
+                "wikeds started",
+                f"Environment: {config.ENV_NAME}. Raw events start empty after a restart, so news bursts "
+                "and rate spikes need about 30 minutes before they can be flagged.", ok=True)
+        while not self.stop:
+            try:
+                self.watchdog_tick()
+            except Exception:
+                log.exception("watchdog failed")
+            time.sleep(WATCHDOG_EVERY)
+
+    def check_problems(self, now=None):
+        """What is wrong right now, as {name: text}. Empty = healthy."""
+        now = time.time() if now is None else now
+        out = {}
+        quiet = now - self.last_event_at
+        if quiet > config.STALL_SECONDS:
+            out["ingest stalled"] = f"No events have arrived from Wikimedia for {_dur(quiet)}."
+        r = STATUS["rollup"]
+        since = now - (r.get("ok_at") or self.started_at)
+        if since > config.ROLLUP_STALE_SECONDS:
+            out["rollup"] = (f"The hourly rollup has not succeeded for {_dur(since)}"
+                             + (". See the Health tab for the error." if r and not r["ok"] else "."))
+        if config.DETECT_ENABLED:
+            d = STATUS["detect"]
+            limit = max(300, 5 * config.DETECT_EVERY_SECONDS)
+            since = now - (d.get("ok_at") or self.started_at)
+            if since > limit:
+                out["anomaly detector"] = (f"The anomaly detector has not succeeded for {_dur(since)}"
+                                           + (". See the Health tab for the error." if d and not d["ok"] else "."))
+        return out
+
+    def watchdog_tick(self, now=None, post=None):
+        """Post once when a problem starts, again every OUTAGE_REMIND_SECONDS while it lasts,
+        and once when it clears. A message that fails to send is retried on the next tick."""
+        now = time.time() if now is None else now
+        current = self.check_problems(now)
+        for name, text in current.items():
+            since, last_sent = self.problems.get(name, (None, 0))
+            if since is None or now - last_sent >= config.OUTAGE_REMIND_SECONDS:
+                if alerts.send_notice(f"Problem: {name}", text, ok=False, post=post):
+                    self.problems[name] = (since or now, now)
+        for name in [n for n in self.problems if n not in current]:
+            since, _ = self.problems[name]
+            if alerts.send_notice(f"Recovered: {name}", f"Back to normal after about {_dur(now - since)}.",
+                                  ok=True, post=post):
+                del self.problems[name]
+
     def maybe_log_stats(self):
         now = time.time()
         if now - self.last_stats < config.STATS_EVERY_SECONDS:
@@ -255,6 +343,7 @@ class Listener:
         if not line or not line.startswith("data: "):
             return
         self.seen += 1
+        self.last_event_at = time.time()
         try:
             event = json.loads(line[6:])
         except json.JSONDecodeError:
@@ -292,6 +381,7 @@ class Listener:
             signal.signal(signal.SIGINT, self.request_stop)
             signal.signal(signal.SIGTERM, self.request_stop)
 
+        self.start_watchdog()
         backoff = 1
         while not self.stop:
             started = time.time()

@@ -80,11 +80,22 @@ _skip = os.getenv("VANDALISM_SKIP_WIKIS")
 VANDALISM_SKIP_WIKIS = tuple(w.strip() for w in
                              ("wikidatawiki,commonswiki" if _skip is None else _skip).split(",") if w.strip())
 
+# ---- labeling ----
+# password that unlocks label editing in the Flags tab (everything else stays public).
+# unset: open when running locally, locked on cloud. Keep it in secrets / .env.
+LABEL_PASSWORD = os.getenv("LABEL_PASSWORD", "").strip()
+
 # ---- alerts ----
 # empty = no alerts. Keep it in secrets / .env, never in git.
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 ALERTS_PER_HOUR = _int("ALERTS_PER_HOUR", 10, 10)   # news bursts, 0 = no limit
 BLANKED_ALERTS_PER_HOUR = _int("BLANKED_ALERTS_PER_HOUR", 3, 3)   # blanked pages, 0 = no limit
+
+# outage alerts: the listener watches itself and posts to the same webhook
+OUTAGE_ALERTS = _bool("OUTAGE_ALERTS", True, True)
+START_NOTICE = _bool("START_NOTICE", True, False)           # a message on every start (not for local runs)
+OUTAGE_REMIND_SECONDS = _int("OUTAGE_REMIND_SECONDS", 21600, 21600)   # repeat an open problem every 6 h
+ROLLUP_STALE_SECONDS = _int("ROLLUP_STALE_SECONDS", 3 * CLEANUP_EVERY_SECONDS, 3 * CLEANUP_EVERY_SECONDS)
 
 # ---- dashboard ----
 TIMEZONE = os.getenv("WIKI_TZ", "Asia/Kolkata")
@@ -120,4 +131,4 @@ def setup_logging():
         "discord alerts: %s", "on" if DISCORD_WEBHOOK_URL else "off (no DISCORD_WEBHOOK_URL)")
     if IS_CLOUD and not SUMMARY_DB_URL:
         logging.getLogger("wiki-config").warning(
-            "on cloud without SUPABASE_DB_URL: summaries will be lost on restart")
+            "on cloud without SUPABASE_DB_URL: summaries will be lost on restart")  

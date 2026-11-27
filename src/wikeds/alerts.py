@@ -42,12 +42,13 @@ _SCHEMA = [
 
 _PENDING = (
     "SELECT f.flag_id, f.kind, f.wiki, f.title, f.editor, f.server, f.reason, f.peak_z, "
-    "f.edits, f.editors, f.bytes_changed, f.first_seen FROM anomaly_flags f "
+    "f.edits, f.editors, f.bytes_changed, f.first_seen, f.rev_new, f.rev_old, f.comment, f.reverted "
+    "FROM anomaly_flags f "
     "WHERE f.first_seen >= {p} AND (f.kind = 'burst' OR (f.kind = 'vandalism' AND f.reason = {p})) "
     "AND NOT EXISTS (SELECT 1 FROM alert_log a WHERE a.flag_id = f.flag_id) "
     "ORDER BY f.first_seen")
 _COLS = ["flag_id", "kind", "wiki", "title", "editor", "server", "reason", "peak_z",
-         "edits", "editors", "bytes_changed", "first_seen"]
+         "edits", "editors", "bytes_changed", "first_seen", "rev_new", "rev_old", "comment", "reverted"]
 _MARK = ("INSERT INTO alert_log (flag_id, sent_at, delivered) VALUES ({p}, {p}, {p}) "
          "ON CONFLICT (flag_id) DO NOTHING")
 _RECENT = ("SELECT COUNT(*) FROM alert_log WHERE sent_at >= {p} AND delivered = 1 "
@@ -101,7 +102,10 @@ def build_message(row):
     """Discord webhook body for one flag. Mentions are switched off so a page title
     like @everyone can't ping anyone."""
     page, hist = _page_url(row["server"], row["title"]), _page_url(row["server"], row["title"], True)
+    diff = flags.diff_url(row["server"], row.get("rev_new"), row.get("rev_old"))
     links = f"[Open page]({page}) · [History]({hist})" if page else ""
+    if diff:
+        links += f" · [Diff]({diff})"
     if row["kind"] == "burst":
         title = f"News burst: {row['title']}"
         z = "" if row["peak_z"] is None else f", z {row['peak_z']:.1f}"
@@ -109,6 +113,10 @@ def build_message(row):
     else:
         title = f"Page blanked: {row['title']}"
         text = f"{_md(row['editor'])} removed {abs(int(row['bytes_changed'])):,} bytes"
+        if row.get("comment"):
+            text += f"\nSummary: {_md(_clip(row['comment'], 200))}"
+        if row.get("reverted"):
+            text += "\nAlready reverted."
     embed = {
         "title": _clip(title, 250),
         "description": _clip(f"{text}\n{links}".strip(), 2000),
@@ -196,6 +204,19 @@ def send_new(store, now=None, url=None, limit=None, post=None, blank_limit=None)
             sent += 1
             total += 1
     return total, False
+
+
+def send_notice(title, text, ok=False, url=None, post=None):
+    """A plain status message (outage, recovery, startup). Needs only the webhook, not the
+    database, so it still works when the database is the thing that is down."""
+    url = config.DISCORD_WEBHOOK_URL if url is None else url
+    if not url:
+        return False
+    post = requests.post if post is None else post
+    body = {"username": "wikeds", "allowed_mentions": {"parse": []},
+            "embeds": [{"title": _clip(title, 250), "description": _clip(text, 1500),
+                        "color": 0x2E9E5B if ok else 0xD03030}]}
+    return _post(url, body, post)
 
 
 def _main():

@@ -25,7 +25,7 @@ _n = 0
 def row(t, bot=0, user="u", old=100, new=150, wiki="enwiki"):
     global _n
     _n += 1
-    return (f"id{_n}", t, t, wiki, "en.wikipedia.org", "edit", "P", user, bot, 0, 0, old, new)
+    return (f"id{_n}", t, t, wiki, "en.wikipedia.org", "edit", "P", user, bot, 0, 0, old, new, None, None, None)
 
 
 def mem_store():

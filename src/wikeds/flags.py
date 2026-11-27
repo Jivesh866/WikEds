@@ -41,48 +41,86 @@ _SCHEMA = [
         first_seen    BIGINT NOT NULL,
         last_seen     BIGINT NOT NULL,
         label         TEXT,
-        labeled_at    BIGINT)""",
+        labeled_at    BIGINT,
+        rev_new       BIGINT,
+        rev_old       BIGINT,
+        comment       TEXT,
+        reverted      INTEGER NOT NULL DEFAULT 0)""",
     "CREATE INDEX IF NOT EXISTS idx_flags_last_seen ON anomaly_flags (last_seen)",
 ]
 
+# columns added after the first release: an existing table gets them on startup
+_NEW_COLS = [("rev_new", "BIGINT"), ("rev_old", "BIGINT"), ("comment", "TEXT"),
+             ("reverted", "INTEGER NOT NULL DEFAULT 0")]
+
 _INSERT_COLS = ["flag_id", "kind", "wiki", "subject", "title", "editor", "server", "reason",
-                "peak_z", "edits", "editors", "bytes_changed", "first_seen", "last_seen"]
+                "peak_z", "edits", "editors", "bytes_changed", "first_seen", "last_seen",
+                "rev_new", "rev_old", "comment", "reverted"]
 _INSERT = ("INSERT INTO anomaly_flags (" + ", ".join(_INSERT_COLS) + ") VALUES ("
            + ", ".join(["{p}"] * len(_INSERT_COLS)) + ") ON CONFLICT (flag_id) DO NOTHING")
 # keep the biggest score / counts seen during the episode
 _UPDATE = ("UPDATE anomaly_flags SET last_seen = {p}, "
            "peak_z = CASE WHEN {p} > peak_z THEN {p} ELSE peak_z END, "
            "edits = CASE WHEN {p} > edits THEN {p} ELSE edits END, "
-           "editors = CASE WHEN {p} > editors THEN {p} ELSE editors END "
+           "editors = CASE WHEN {p} > editors THEN {p} ELSE editors END, "
+           "reverted = CASE WHEN {p} > reverted THEN {p} ELSE reverted END "
            "WHERE flag_id = {p}")
 _OPEN = ("SELECT flag_id, kind, wiki, subject FROM anomaly_flags "
          "WHERE last_seen >= {p} ORDER BY last_seen")
 
 READ_COLS = ["flag_id", "kind", "wiki", "title", "editor", "server", "reason", "peak_z",
-             "edits", "editors", "bytes_changed", "first_seen", "last_seen", "label"]
+             "edits", "editors", "bytes_changed", "first_seen", "last_seen", "label",
+             "rev_new", "rev_old", "comment", "reverted"]
 _READ = ("SELECT " + ", ".join(READ_COLS) + " FROM anomaly_flags "
          "WHERE last_seen >= {p} ORDER BY last_seen DESC LIMIT {p}")
 
 
+def _columns(cur, is_pg):
+    if is_pg:
+        cur.execute("SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = 'public' AND table_name = 'anomaly_flags'")
+        return {r[0] for r in cur.fetchall()}
+    cur.execute("PRAGMA table_info(anomaly_flags)")
+    return {r[1] for r in cur.fetchall()}
+
+
 def ensure_schema(store):
-    """Create the table once. Same idea as summary_store: check first, then
-    serialize the create with an advisory lock on postgres."""
+    """Create the table (and add newer columns to an old one) once. Same idea as
+    summary_store: check first, then serialize the change with an advisory lock on postgres."""
     is_pg = store.p != "?"
     with _lock:
         if is_pg and store.label in _ready:
             return
-        if is_pg and store._exec("SELECT to_regclass('public.anomaly_flags') IS NOT NULL").fetchone()[0]:
-            _ready.add(store.label)
-            return
+        if is_pg:
+            done = store._exec("SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = 'public' "
+                               "AND table_name = 'anomaly_flags' AND column_name IN ('rev_new', 'rev_old', "
+                               "'comment', 'reverted')").fetchone()[0]
+            if done == len(_NEW_COLS):
+                _ready.add(store.label)
+                return
         with store._tx():
             cur = store.con.cursor()
             if is_pg:
                 cur.execute("SELECT pg_advisory_xact_lock(%s)", (_PG_LOCK_KEY,))
             for stmt in _SCHEMA:
                 cur.execute(stmt)
+            have = _columns(cur, is_pg)
+            for name, decl in _NEW_COLS:
+                if name not in have:
+                    cur.execute(f"ALTER TABLE anomaly_flags ADD COLUMN {name} {decl}")
             if is_pg:
                 cur.execute("ALTER TABLE anomaly_flags ENABLE ROW LEVEL SECURITY")
-        _ready.add(store.label)
+        if is_pg:
+            _ready.add(store.label)
+
+
+def diff_url(server, rev_new, rev_old):
+    """Link to the diff of an edit (or to the page version, for a new page)."""
+    if not server or rev_new is None or pd.isna(rev_new):
+        return None
+    if rev_old is None or pd.isna(rev_old) or not rev_old:
+        return f"https://{server}/w/index.php?oldid={int(rev_new)}"
+    return f"https://{server}/w/index.php?diff={int(rev_new)}&oldid={int(rev_old)}"
 
 
 def save(store, found, now, gap=None):
@@ -102,10 +140,12 @@ def save(store, found, now, gap=None):
             fid = f"{f['kind']}|{f['wiki']}|{f['subject']}|{now}"
             inserts.append((fid, f["kind"], f["wiki"], f["subject"], f["title"], f["editor"],
                             f["server"], f["reason"], f["z"], f["edits"], f["editors"],
-                            f["bytes_changed"], now, now))
+                            f["bytes_changed"], now, now, f.get("rev_new"), f.get("rev_old"),
+                            f.get("comment"), int(f.get("reverted") or 0)))
         else:
+            rv = int(f.get("reverted") or 0)
             updates.append((now, f["z"], f["z"], f["edits"], f["edits"],
-                            f["editors"], f["editors"], fid))
+                            f["editors"], f["editors"], rv, rv, fid))
     with store._tx():
         cur = store.con.cursor()
         if inserts:
@@ -120,7 +160,9 @@ def read(store, since, limit=1000):
     ensure_schema(store)
     rows = store._exec(_READ, (int(since), int(limit))).fetchall()
     df = pd.DataFrame(rows, columns=READ_COLS)
-    df["peak_z"] = pd.to_numeric(df["peak_z"])
+    for col in ("peak_z", "rev_new", "rev_old"):
+        df[col] = pd.to_numeric(df[col])
+    df["reverted"] = pd.to_numeric(df["reverted"]).fillna(0).astype(int)
     return df
 
 
@@ -145,7 +187,7 @@ def prune(store, cutoff):
 def precision(df, kind_names=None):
     """Per detector: how many flags, how many reviewed, how many were real."""
     names = kind_names or {}
-    cols = ["detector", "flags", "reviewed", "real", "false alarms", "precision"]
+    cols = ["detector", "flags", "reviewed", "real", "false alarms", "precision", "reverted"]
     rows = []
     for kind, g in df.groupby("kind"):
         decided = g[g["label"].isin(_DECIDED)]
@@ -154,5 +196,6 @@ def precision(df, kind_names=None):
             "detector": names.get(kind, kind), "flags": len(g), "reviewed": len(decided),
             "real": real, "false alarms": len(decided) - real,
             "precision": f"{100 * real / len(decided):.0f}%" if len(decided) else "n/a",
+            "reverted": int((g["reverted"] == 1).sum()) if "reverted" in g else 0,
         })
     return pd.DataFrame(rows, columns=cols)
