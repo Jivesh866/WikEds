@@ -15,7 +15,7 @@ from wikeds.summary_store import open_store
 log = logging.getLogger("wiki-aggregator")
 
 DB_PATH = config.DB_PATH
-WINDOW_HOURS = 3          # how much recent raw data to keep in memory
+WINDOW_HOURS = 1.25          # how much recent raw data to keep in memory
 OVERLAP_SECONDS = 120     # re-read this much on each refresh to catch late events
 LOCAL_TZ = config.TIMEZONE
 HISTORY_DAYS = 30         # how much of summary_hourly to keep in memory
